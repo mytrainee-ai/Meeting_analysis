@@ -1,0 +1,2 @@
+"""Meeting Analysis application."""
+
