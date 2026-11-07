@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import html
+import hmac
 import os
 import re
 import secrets
@@ -36,7 +38,6 @@ MAX_DURATION_SECONDS = 600
 DATA_DIR = Path(os.getenv("MEETING_DATA_DIR", "data")).resolve()
 UPLOAD_DIR = DATA_DIR / "uploads"
 DATABASE_PATH = DATA_DIR / "meetings.sqlite3"
-SESSION_MAX_AGE_SECONDS = 12 * 60 * 60
 MEDIA_RETENTION = timedelta(hours=24)
 
 
@@ -59,7 +60,12 @@ def ensure_session_secret() -> str:
     return secret
 
 
-SESSION_SECRET = ensure_session_secret()
+SESSION_MASTER_SECRET = ensure_session_secret()
+# Rotate the signing key on every process start so restart/deploy invalidates
+# all previously issued session cookies without changing the persistent master.
+SESSION_SECRET = hmac.new(
+    SESSION_MASTER_SECRET.encode("utf-8"), secrets.token_bytes(32), hashlib.sha256
+).hexdigest()
 
 
 class UploadLimitMiddleware:
@@ -125,7 +131,7 @@ app.add_middleware(
     SessionMiddleware,
     secret_key=SESSION_SECRET,
     session_cookie="meeting_analysis_session",
-    max_age=SESSION_MAX_AGE_SECONDS,
+    max_age=None,
     same_site="lax",
     https_only=os.getenv("COOKIE_SECURE", "false").lower() == "true",
 )
