@@ -159,7 +159,6 @@ def _transcribe(client: OpenAI, audio_path: Path) -> str:
         result = client.audio.transcriptions.create(
             model=os.getenv("OPENAI_TRANSCRIPTION_MODEL", "gpt-transcribe"),
             file=audio_file,
-            languages=["ru"],
         )
     transcript = result.text.strip()
     if not transcript:
