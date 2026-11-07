@@ -776,6 +776,46 @@ def meeting_summary(request: Request) -> dict[str, int]:
     return totals
 
 
+@app.delete("/api/meetings/mine")
+def delete_my_meetings(request: Request) -> dict[str, int | str]:
+    """Delete only the signed-in user's meetings, leaving all accounts intact."""
+    user = require_user(request)
+    owner_id = str(user["id"])
+    temp_root = DATA_DIR / "temporary_audio"
+
+    # Serialize against processing/retry requests so no meeting starts processing
+    # between the active-state check and deletion.
+    with sqlite3.connect(DATABASE_PATH, timeout=30) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        rows = connection.execute(
+            "SELECT id, status, media_extension FROM meetings WHERE owner_id = ?",
+            (owner_id,),
+        ).fetchall()
+        if any(str(row[1]).startswith("processing_") for row in rows):
+            raise HTTPException(
+                status_code=409,
+                detail="Сначала дождитесь завершения обработки встреч, затем повторите удаление.",
+            )
+
+        try:
+            for meeting_id, _status, media_extension in rows:
+                extension = media_extension if media_extension in {".mp4", ".webm"} else ".mp4"
+                (UPLOAD_DIR / f"{meeting_id}{extension}").unlink(missing_ok=True)
+                if temp_root.exists():
+                    for path in temp_root.iterdir():
+                        if path.name.startswith(f"meeting-{meeting_id}-") and path.is_dir() and not path.is_symlink():
+                            shutil.rmtree(path)
+        except OSError:
+            raise HTTPException(
+                status_code=500,
+                detail="Не удалось удалить файлы встреч. Записи в базе сохранены; повторите попытку.",
+            ) from None
+
+        connection.execute("DELETE FROM meetings WHERE owner_id = ?", (owner_id,))
+        connection.commit()
+    return {"status": "deleted", "deleted_count": len(rows)}
+
+
 @app.get("/api/meetings/{meeting_id}")
 def get_meeting(meeting_id: str, request: Request) -> dict[str, object]:
     user = require_user(request)
