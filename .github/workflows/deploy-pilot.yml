@@ -1,0 +1,91 @@
+name: Deploy pilot server
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: meeting-analysis-pilot-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # Keep disabled until the deploy user, host key, GitHub secrets and server service are configured.
+    if: ${{ vars.PILOT_DEPLOY_ENABLED == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Package committed source
+        env:
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          set -Eeuo pipefail
+          python - "$RELEASE_SHA" <<'PY'
+          import subprocess
+          import sys
+
+          commit = sys.argv[1]
+          paths = subprocess.check_output(
+              ["git", "ls-tree", "-r", "--name-only", commit], text=True
+          ).splitlines()
+          unsafe = []
+          for path in paths:
+              parts = path.split("/")
+              basename = parts[-1]
+              if "data" in parts or basename == ".env":
+                  unsafe.append(path)
+              elif basename.startswith(".env.") and basename != ".env.example":
+                  unsafe.append(path)
+          if unsafe:
+              print("Refusing to package local data or secret files:", file=sys.stderr)
+              print("\n".join(unsafe), file=sys.stderr)
+              raise SystemExit(1)
+          PY
+          git archive --format=tar.gz --prefix=release/ --output="$RUNNER_TEMP/release.tar.gz" "$RELEASE_SHA"
+
+      - name: Configure SSH
+        env:
+          DEPLOY_HOST: ${{ vars.PILOT_DEPLOY_HOST }}
+          DEPLOY_USER: ${{ vars.PILOT_DEPLOY_USER }}
+          DEPLOY_PRIVATE_KEY: ${{ secrets.PILOT_SSH_PRIVATE_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.PILOT_KNOWN_HOSTS }}
+        run: |
+          set -Eeuo pipefail
+          test -n "$DEPLOY_HOST"
+          test -n "$DEPLOY_USER"
+          test -n "$DEPLOY_PRIVATE_KEY"
+          test -n "$DEPLOY_KNOWN_HOSTS"
+          install -m 600 /dev/null "$RUNNER_TEMP/deploy_key"
+          printf '%s\n' "$DEPLOY_PRIVATE_KEY" > "$RUNNER_TEMP/deploy_key"
+          install -m 600 /dev/null "$RUNNER_TEMP/known_hosts"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$RUNNER_TEMP/known_hosts"
+
+      - name: Upload release archive
+        env:
+          DEPLOY_HOST: ${{ vars.PILOT_DEPLOY_HOST }}
+          DEPLOY_USER: ${{ vars.PILOT_DEPLOY_USER }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          set -Eeuo pipefail
+          ssh_options=(-i "$RUNNER_TEMP/deploy_key" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$RUNNER_TEMP/known_hosts")
+          scp "${ssh_options[@]}" "$RUNNER_TEMP/release.tar.gz" "$DEPLOY_USER@$DEPLOY_HOST:/tmp/meeting-analysis-$RELEASE_SHA.tar.gz"
+
+      - name: Activate release and verify health
+        env:
+          DEPLOY_HOST: ${{ vars.PILOT_DEPLOY_HOST }}
+          DEPLOY_USER: ${{ vars.PILOT_DEPLOY_USER }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          set -Eeuo pipefail
+          ssh_options=(-i "$RUNNER_TEMP/deploy_key" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$RUNNER_TEMP/known_hosts")
+          ssh "${ssh_options[@]}" "$DEPLOY_USER@$DEPLOY_HOST" bash -s -- "$RELEASE_SHA" < ops/deploy-release.sh

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -68,8 +69,23 @@ ANALYSIS_SCHEMA: dict[str, object] = {
                 "required": ["question", "evidence"],
             },
         },
+        "meeting_details": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "agenda": {"type": "array", "items": {"type": "object", "additionalProperties": False, "properties": {"text": {"type": "string"}, "evidence": {"type": "string"}}, "required": ["text", "evidence"]}},
+                "conclusions": {"type": "array", "items": {"type": "object", "additionalProperties": False, "properties": {"text": {"type": "string"}, "evidence": {"type": "string"}}, "required": ["text", "evidence"]}},
+                "next_meeting_needed": {"type": "string", "enum": ["yes", "no", "unspecified"]},
+                "next_meeting_needed_evidence": {"type": "string"},
+                "next_meeting_date": {"type": "string"},
+                "next_meeting_date_evidence": {"type": "string"},
+                "next_meeting_topic": {"type": "string"},
+                "next_meeting_topic_evidence": {"type": "string"},
+            },
+            "required": ["agenda", "conclusions", "next_meeting_needed", "next_meeting_needed_evidence", "next_meeting_date", "next_meeting_date_evidence", "next_meeting_topic", "next_meeting_topic_evidence"],
+        },
     },
-    "required": ["summary_points", "topics", "decisions", "tasks", "open_questions"],
+    "required": ["summary_points", "topics", "decisions", "tasks", "open_questions", "meeting_details"],
 }
 
 
@@ -128,7 +144,14 @@ def _analyze(client: OpenAI, transcript: str) -> dict[str, list[dict[str, str]]]
             "не добавляй пункт. В summary_points добавь короткие тезисы содержания. В topics включи "
             "до пяти главных тем (меньше, если материала мало). Для задач указывай responsible и deadline "
             "только когда они прямо названы; иначе верни пустую строку. Не определяй личности по голосу. "
-            "Если решений или открытых вопросов нет, оставь соответствующий массив пустым."
+            "Если решений или открытых вопросов нет, оставь соответствующий массив пустым. "
+            "Дополнительно заполни meeting_details: agenda — краткие пункты повестки, которые обсуждались; "
+            "conclusions — подтверждённые итоговые выводы (не дублируй дословно список решений без необходимости). "
+            "Для повестки и выводов используй только содержание транскрипта. next_meeting_needed поставь yes "
+            "только если следующая встреча прямо назначена/запланирована, no только если прямо сказано, что она не нужна, "
+            "иначе unspecified. next_meeting_date указывай только при прямо названной однозначной календарной дате "
+            "в формате YYYY-MM-DD; относительные даты и неоднозначные даты оставляй пустыми. Тему следующей встречи "
+            "указывай только если она прямо прозвучала; иначе оставь пустой строкой."
         ),
         input=f"Расшифровка встречи:\n\n{transcript}",
         text={
@@ -188,6 +211,44 @@ def _validate_evidence(result: dict[str, object], transcript: str) -> dict[str, 
                 "deadline": deadline.strip(), "evidence": evidence.strip(),
             })
     verified["topics"] = verified["topics"][:5]
+    details = result.get("meeting_details", {})
+    if not isinstance(details, dict):
+        details = {}
+    def clean_lines(key: str) -> list[str]:
+        items = details.get(key, [])
+        if not isinstance(items, list):
+            return []
+        return [
+            item["text"].strip() for item in items
+            if isinstance(item, dict) and isinstance(item.get("text"), str) and item["text"].strip()
+            and isinstance(item.get("evidence"), str) and item["evidence"].strip() in transcript
+        ]
+    needed = details.get("next_meeting_needed")
+    needed_evidence = details.get("next_meeting_needed_evidence", "")
+    if needed not in {"yes", "no", "unspecified"} or not isinstance(needed_evidence, str) or needed_evidence.strip() not in transcript:
+        needed = "unspecified"
+    next_date = details.get("next_meeting_date", "")
+    if not isinstance(next_date, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", next_date):
+        next_date = ""
+    else:
+        try:
+            datetime.strptime(next_date, "%Y-%m-%d")
+        except ValueError:
+            next_date = ""
+    date_evidence = details.get("next_meeting_date_evidence", "")
+    if not next_date or not isinstance(date_evidence, str) or date_evidence.strip() not in transcript:
+        next_date = ""
+    next_topic = details.get("next_meeting_topic", "")
+    topic_evidence = details.get("next_meeting_topic_evidence", "")
+    if not isinstance(next_topic, str) or not isinstance(topic_evidence, str) or topic_evidence.strip() not in transcript:
+        next_topic = ""
+    verified["meeting_details"] = {
+        "agenda": clean_lines("agenda"),
+        "conclusions": clean_lines("conclusions"),
+        "next_meeting_needed": needed,
+        "next_meeting_date": next_date,
+        "next_meeting_topic": next_topic.strip(),
+    }
     return verified
 
 
@@ -217,7 +278,7 @@ def process_meeting(meeting_id: str, data_dir: Path) -> None:
         transcript = row["transcript"]
         if not transcript:
             stage = "подготовка аудио"
-            _set_status(database_path, meeting_id, "processing_transcription")
+            _set_status(database_path, meeting_id, "processing_audio_extraction")
             ffmpeg = shutil.which("ffmpeg")
             if not ffmpeg:
                 raise FileNotFoundError("ffmpeg")
@@ -242,6 +303,7 @@ def process_meeting(meeting_id: str, data_dir: Path) -> None:
                 if audio_path.stat().st_size > MAX_TRANSCRIPTION_BYTES:
                     raise ValueError("prepared audio exceeds transcription limit")
                 stage = "транскрибация"
+                _set_status(database_path, meeting_id, "processing_transcription")
                 transcript = _transcribe(client, audio_path)
 
             with _connect(database_path) as connection:
@@ -255,10 +317,23 @@ def process_meeting(meeting_id: str, data_dir: Path) -> None:
         stage = "анализ расшифровки"
         analysis = _analyze(client, transcript)
         completed_at = datetime.now(timezone.utc).isoformat()
+        details = analysis.get("meeting_details", {})
+        agenda = "\n".join(details.get("agenda", []))
+        conclusions = "\n".join(details.get("conclusions", []))
         with _connect(database_path) as connection:
             connection.execute(
-                "UPDATE meetings SET analysis_json = ?, status = ?, error_message = NULL, processed_at = ? WHERE id = ?",
-                (json.dumps(analysis, ensure_ascii=False), "completed", completed_at, meeting_id),
+                """UPDATE meetings SET analysis_json = ?,
+                   agenda = CASE WHEN COALESCE(agenda, '') = '' THEN ? ELSE agenda END,
+                   notes = CASE WHEN COALESCE(notes, '') = '' THEN ? ELSE notes END,
+                   next_meeting_needed = CASE WHEN COALESCE(next_meeting_needed, 'unspecified') = 'unspecified' THEN ? ELSE next_meeting_needed END,
+                   next_meeting_date = COALESCE(next_meeting_date, ?),
+                   next_meeting_topic = CASE WHEN COALESCE(next_meeting_topic, '') = '' THEN ? ELSE next_meeting_topic END,
+                   meeting_date = COALESCE(meeting_date, substr(created_at, 1, 10)),
+                   status = ?, error_message = NULL, processed_at = ? WHERE id = ?""",
+                (json.dumps(analysis, ensure_ascii=False), agenda, conclusions,
+                 details.get("next_meeting_needed", "unspecified"),
+                 details.get("next_meeting_date") or None,
+                 details.get("next_meeting_topic", ""), "completed", completed_at, meeting_id),
             )
     except Exception as exc:
         if isinstance(exc, AuthenticationError):

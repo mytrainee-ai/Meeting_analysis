@@ -11,7 +11,7 @@ import shutil
 import sqlite3
 import subprocess
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -144,6 +144,13 @@ def initialize_storage() -> None:
                 created_at TEXT NOT NULL,
                 owner_id TEXT,
                 media_extension TEXT,
+                title TEXT,
+                meeting_date TEXT,
+                agenda TEXT,
+                notes TEXT,
+                next_meeting_needed TEXT,
+                next_meeting_date TEXT,
+                next_meeting_topic TEXT,
                 transcript TEXT,
                 analysis_json TEXT,
                 error_message TEXT,
@@ -155,6 +162,13 @@ def initialize_storage() -> None:
         for column, column_type in (
             ("owner_id", "TEXT"),
             ("media_extension", "TEXT"),
+            ("title", "TEXT"),
+            ("meeting_date", "TEXT"),
+            ("agenda", "TEXT"),
+            ("notes", "TEXT"),
+            ("next_meeting_needed", "TEXT"),
+            ("next_meeting_date", "TEXT"),
+            ("next_meeting_topic", "TEXT"),
             ("transcript", "TEXT"),
             ("analysis_json", "TEXT"),
             ("error_message", "TEXT"),
@@ -166,6 +180,7 @@ def initialize_storage() -> None:
         connection.execute(
             """CREATE TABLE IF NOT EXISTS users (
                 id TEXT PRIMARY KEY,
+                name TEXT NOT NULL DEFAULT '',
                 email TEXT NOT NULL UNIQUE,
                 password_hash TEXT NOT NULL,
                 role TEXT NOT NULL CHECK (role IN ('admin', 'user')),
@@ -173,6 +188,9 @@ def initialize_storage() -> None:
                 created_at TEXT NOT NULL
             )"""
         )
+        user_columns = {row[1] for row in connection.execute("PRAGMA table_info(users)").fetchall()}
+        if "name" not in user_columns:
+            connection.execute("ALTER TABLE users ADD COLUMN name TEXT NOT NULL DEFAULT ''")
         connection.execute(
             """CREATE TABLE IF NOT EXISTS invitations (
                 id TEXT PRIMARY KEY,
@@ -350,12 +368,13 @@ def startup() -> None:
     initialize_storage()
     with sqlite3.connect(DATABASE_PATH) as connection:
         connection.execute(
-            "UPDATE meetings SET status = ?, error_message = ? WHERE status IN (?, ?)",
+            "UPDATE meetings SET status = ?, error_message = ? WHERE status IN (?, ?, ?)",
             (
                 "failed_transcription",
                 "Обработка была прервана перезапуском сервера. Её можно запустить повторно вручную.",
                 "processing_transcription",
                 "processing_analysis",
+                "processing_audio_extraction",
             ),
         )
     cleanup_expired_media()
@@ -457,9 +476,13 @@ def register_page() -> HTMLResponse:
 def register(
     request: Request,
     invite_code: str = Form(...),
+    name: str = Form(...),
     email: str = Form(...),
     password: str = Form(...),
 ) -> Response:
+    name = name.strip()
+    if not name or len(name) > 120:
+        return HTMLResponse(render_register_page("Укажите имя (не более 120 символов)."), status_code=400)
     email = normalize_email(email)
     if not valid_email(email):
         return HTMLResponse(render_register_page("Введите корректный адрес электронной почты."), status_code=400)
@@ -478,8 +501,8 @@ def register(
             if invitation is None:
                 return HTMLResponse(render_register_page("Приглашение недействительно или отозвано."), status_code=400)
             connection.execute(
-                "INSERT INTO users (id, email, password_hash, role, is_active, created_at) VALUES (?, ?, ?, 'user', 1, ?)",
-                (user_id, email, hash_password(password), now),
+                "INSERT INTO users (id, name, email, password_hash, role, is_active, created_at) VALUES (?, ?, ?, ?, 'user', 1, ?)",
+                (user_id, name, email, hash_password(password), now),
             )
             connection.execute("UPDATE invitations SET last_used_at = ? WHERE id = ?", (now, invitation[0]))
     except sqlite3.IntegrityError:
@@ -586,39 +609,46 @@ main{max-width:1120px;margin:70px auto;padding:0 24px;display:grid;grid-template
 .eyebrow{font-size:12px;text-transform:uppercase;letter-spacing:.13em;font-weight:700;color:#448061}.copy h1{font-size:48px;line-height:1.08;letter-spacing:-.045em;margin:18px 0}.copy p{font-size:17px;line-height:1.65;color:#607067;max-width:520px;margin:0}
 .checks{display:flex;gap:9px;flex-wrap:wrap;margin-top:30px}.checks span{font-size:12px;color:#59675e;background:#e9eee7;border-radius:999px;padding:9px 12px}
 .card{background:white;border:1px solid #e3e8e1;border-radius:20px;padding:26px;box-shadow:0 18px 55px #253f2710}.card h2{font-size:19px;margin:0 0 7px;letter-spacing:-.02em}.hint{color:#77847b;font-size:13px;margin:0 0 21px}
-.drop{min-height:190px;border:1.5px dashed #bdc9bf;border-radius:14px;background:#fafcf9;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:20px;transition:.15s}.drop.over{border-color:#39845e;background:#f2f8f3}
+.drop{min-height:190px;border:1.5px dashed #bdc9bf;border-radius:14px;background:#fafcf9;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:20px;transition:.15s}.drop.over{border-color:#39845e;background:#f2f8f3}.drop.disabled{opacity:.55;pointer-events:none}
 .icon{width:42px;height:42px;border-radius:13px;background:#e8f2e9;color:#38734f;display:grid;place-items:center;font-size:21px;margin-bottom:12px}.drop strong{font-size:14px}.drop small{font-size:12px;color:#829087;margin-top:7px}input{display:none}
 button,.choose{font:inherit;border:0;cursor:pointer}.choose{margin-top:16px;color:#287148;background:white;border:1px solid #dce7de;border-radius:9px;padding:9px 13px;font-size:12px;font-weight:650}
 .fileline{display:none;margin-top:14px;padding:12px;background:#f4f7f3;border-radius:11px;align-items:center;gap:11px}.filebadge{width:34px;height:34px;background:#e4eee6;border-radius:9px;display:grid;place-items:center;color:#39714d;font-size:11px;font-weight:800}.filemeta{min-width:0;flex:1}.filemeta strong{font-size:12px;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.filemeta small{font-size:11px;color:#7c8880}.remove{background:none;color:#829087;font-size:18px;padding:4px}
-.submit{width:100%;padding:13px;border-radius:10px;color:white;background:#246b49;font-size:13px;font-weight:700;margin-top:17px;transition:.15s}.submit:hover:not(:disabled){background:#1b593b}.submit:disabled{opacity:.45;cursor:not-allowed}
 .progress{display:none;margin-top:15px}.progressrow{display:flex;justify-content:space-between;font-size:11px;color:#67766b;margin-bottom:8px}.track{height:6px;border-radius:8px;background:#edf1ec;overflow:hidden}.fill{height:100%;width:0;background:#3a8a5c;transition:width .15s}
-.message{display:none;margin-top:14px;padding:12px;border-radius:10px;font-size:12px;line-height:1.5}.message.error{display:block;background:#fff2ef;color:#9c4339}.message.success{display:block;background:#edf7ee;color:#276440}.message a{color:inherit;font-weight:700}.back{font-size:13px;color:#287148;text-decoration:none}.cancel{width:100%;padding:11px;border:1px solid #dce7de;border-radius:10px;background:white;color:#47594c;font-size:13px;font-weight:650;margin-top:9px;cursor:pointer}
-.privacy{font-size:11px;color:#89938b;line-height:1.5;margin:16px 0 0}.privacy b{color:#69766c}
+.message{display:none;margin-top:14px;padding:12px;border-radius:10px;font-size:12px;line-height:1.5}.message.error{display:block;background:#fff2ef;color:#9c4339}.message.info{display:block;background:#eef4ff;color:#345885}.message.success{display:block;background:#edf7ee;color:#276440}.message a{color:inherit;font-weight:700}.back{font-size:13px;color:#287148;text-decoration:none}.cancel{width:100%;padding:11px;border:1px solid #dce7de;border-radius:10px;background:white;color:#47594c;font-size:13px;font-weight:650;margin-top:9px;cursor:pointer}
+.consent-row{display:flex;gap:9px;align-items:flex-start;margin-top:16px;font-size:11px;line-height:1.5;color:#59675e}.consent-row input{display:block;flex:0 0 auto;width:15px;height:15px;margin:1px 0 0;accent-color:#246b49}.consent-row a{color:#287148}
 @media(max-width:800px){main{grid-template-columns:1fr;gap:35px;margin:48px auto}.copy h1{font-size:38px}.card{max-width:520px;width:100%}}
 </style></head><body><header><a href="/" class="brand"><i>М</i>Встречи · Все встречи</a></header>
 <main><section class="copy"><a href="/" class="back">← Назад к встречам</a><div class="eyebrow" style="margin-top:32px">Meeting analysis</div><h1>Вернитесь к сути<br>вашей встречи</h1><p>Загрузите запись, чтобы подготовить её к обработке. Сначала мы проверим формат, длительность и наличие звука.</p><div class="checks"><span>MP4</span><span>WebM</span><span>До 25 МБ</span><span>До 10 минут</span></div></section>
-<section class="card"><h2>Загрузить видео</h2><p class="hint">Выберите файл с записью встречи</p>
+<section class="card"><h2>Загрузить видео</h2><p class="hint">Выберите файл с записью встречи — загрузка начнётся автоматически после согласия</p>
 <label class="drop" id="drop" for="file"><span class="icon">↑</span><strong>Перетащите видео сюда</strong><small>Файл MP4 или WebM, не больше 25 МБ</small><span class="choose">Выбрать файл</span></label><input id="file" type="file" accept="video/mp4,video/webm,.mp4,.webm">
 <div class="fileline" id="fileline"><span class="filebadge" id="filebadge">ВИДЕО</span><span class="filemeta"><strong id="filename"></strong><small id="filesize"></small></span><button class="remove" id="remove" aria-label="Убрать файл">×</button></div>
 <div class="progress" id="progress"><div class="progressrow"><span id="progresslabel">Загрузка файла</span><span id="percent">0%</span></div><div class="track"><div class="fill" id="fill"></div></div></div>
-<button class="submit" id="submit" disabled>Загрузить видео</button><button class="cancel" id="cancel" type="button" hidden>Отменить загрузку</button><div class="message" id="message" role="status"></div>
-<p class="privacy"><b>Конфиденциальность.</b> На этом этапе файл сохраняется в локальном хранилище приложения. Облачная обработка будет подключена отдельно.</p></section></main>
+<label class="consent-row"><input id="cloudConsent" type="checkbox" required><span>После загрузки обработка начнётся автоматически: аудио и расшифровка будут переданы в облачный AI-сервис. Запросы могут тарифицироваться провайдером.</span></label>
+<button class="cancel" id="cancel" type="button" hidden>Отменить загрузку</button><div class="message" id="message" role="status" aria-live="polite"></div>
+</section></main>
 <script>
-const input=document.querySelector('#file'),drop=document.querySelector('#drop'),fileline=document.querySelector('#fileline'),submit=document.querySelector('#submit'),cancel=document.querySelector('#cancel'),message=document.querySelector('#message');let selected=null,activeXhr=null;
+const input=document.querySelector('#file'),drop=document.querySelector('#drop'),fileline=document.querySelector('#fileline'),cancel=document.querySelector('#cancel'),message=document.querySelector('#message'),cloudConsent=document.querySelector('#cloudConsent'),removeFile=document.querySelector('#remove');let selected=null,activeXhr=null;
 function formatSize(n){return n<1048576?`${Math.ceil(n/1024)} КБ`:`${(n/1048576).toFixed(1)} МБ`}
-function setFile(file){message.className='message';message.textContent='';if(!file){selected=null;fileline.style.display='none';submit.disabled=true;input.value='';return}if(file.size>25*1024*1024){showError('Размер файла превышает лимит 25 МБ.',true);return}selected=file;document.querySelector('#filename').textContent=file.name;document.querySelector('#filesize').textContent=formatSize(file.size);document.querySelector('#filebadge').textContent=file.name.toLowerCase().endsWith('.webm')?'WEBM':'MP4';fileline.style.display='flex';submit.disabled=false}
-function showError(text,clearSelection=false){message.className='message error';message.textContent=text;document.querySelector('#progress').style.display='none';if(clearSelection){selected=null;fileline.style.display='none'}submit.disabled=!selected}
-input.addEventListener('change',()=>setFile(input.files[0]));document.querySelector('#remove').onclick=()=>setFile(null);
+function updateControls(uploading){input.disabled=uploading;cloudConsent.disabled=uploading;removeFile.disabled=uploading;drop.classList.toggle('disabled',uploading)}
+function showError(text,clearSelection=false){message.className='message error';message.textContent=text;document.querySelector('#progress').style.display='none';if(clearSelection){selected=null;fileline.style.display='none';input.value=''}}
+function setFile(file){if(activeXhr)return;message.className='message';message.textContent='';if(!file){selected=null;fileline.style.display='none';input.value='';return}if(file.size>25*1024*1024){showError('Размер файла превышает лимит 25 МБ.',true);return}selected=file;document.querySelector('#filename').textContent=file.name;document.querySelector('#filesize').textContent=formatSize(file.size);document.querySelector('#filebadge').textContent=file.name.toLowerCase().endsWith('.webm')?'WEBM':'MP4';fileline.style.display='flex';if(cloudConsent.checked)startUpload();else{message.className='message info';message.textContent='Отметьте согласие — загрузка начнётся автоматически.'}}
+function startUpload(){if(!selected||!cloudConsent.checked||activeXhr)return;const file=selected,form=new FormData();form.append('file',file);form.append('cloud_processing_consent','true');cancel.hidden=false;message.className='message';document.querySelector('#progress').style.display='block';document.querySelector('#progresslabel').textContent='Загрузка файла';updateControls(true);const xhr=new XMLHttpRequest();activeXhr=xhr;xhr.open('POST','/api/meetings/upload');xhr.upload.onprogress=e=>{if(e.lengthComputable){const pct=Math.round(e.loaded/e.total*100);document.querySelector('#fill').style.width=pct+'%';document.querySelector('#percent').textContent=pct+'%'}};xhr.onload=()=>{activeXhr=null;cancel.hidden=true;let body={};try{body=JSON.parse(xhr.responseText)}catch{}if(xhr.status>=200&&xhr.status<300){document.querySelector('#progresslabel').textContent='Запускаем обработку';document.querySelector('#fill').style.width='100%';document.querySelector('#percent').textContent='100%';location.href='/'}else{updateControls(false);showError(body.detail||'Не удалось загрузить видео. Выберите файл ещё раз и повторите попытку.',true)}};xhr.onerror=()=>{activeXhr=null;cancel.hidden=true;updateControls(false);showError('Не удалось связаться с сервером. Проверьте подключение и выберите файл ещё раз.',true)};xhr.onabort=()=>{activeXhr=null;cancel.hidden=true;updateControls(false);document.querySelector('#fill').style.width='0';document.querySelector('#percent').textContent='0%';showError('Загрузка отменена. Выберите файл ещё раз, чтобы начать заново.',true)};xhr.send(form)}
+input.addEventListener('change',()=>setFile(input.files[0]));removeFile.onclick=()=>setFile(null);
 for(const name of ['dragenter','dragover'])drop.addEventListener(name,e=>{e.preventDefault();drop.classList.add('over')});for(const name of ['dragleave','drop'])drop.addEventListener(name,e=>{e.preventDefault();drop.classList.remove('over')});drop.addEventListener('drop',e=>setFile(e.dataTransfer.files[0]));
-submit.addEventListener('click',()=>{if(!selected)return;const file=selected,form=new FormData();form.append('file',file);submit.disabled=true;cancel.hidden=false;message.className='message';document.querySelector('#progress').style.display='block';document.querySelector('#progresslabel').textContent='Загрузка файла';const xhr=new XMLHttpRequest();activeXhr=xhr;xhr.open('POST','/api/meetings/upload');xhr.upload.onprogress=e=>{if(e.lengthComputable){const pct=Math.round(e.loaded/e.total*100);document.querySelector('#fill').style.width=pct+'%';document.querySelector('#percent').textContent=pct+'%'}};xhr.onload=()=>{activeXhr=null;cancel.hidden=true;let body={};try{body=JSON.parse(xhr.responseText)}catch{}document.querySelector('#progresslabel').textContent='Проверка видео';if(xhr.status>=200&&xhr.status<300){document.querySelector('#fill').style.width='100%';document.querySelector('#percent').textContent='100%';message.className='message success';message.innerHTML=`Видео загружено и проверено. Обработка ещё не запускалась. <a href="/meetings/${body.id}">Открыть встречу</a>`;fileline.style.display='none';document.querySelector('#progress').style.display='none';selected=null;input.value=''}else showError(body.detail||'Не удалось загрузить видео. Попробуйте ещё раз.');submit.disabled=!selected};xhr.onerror=()=>{activeXhr=null;cancel.hidden=true;showError('Не удалось связаться с сервером. Проверьте подключение и повторите попытку.');submit.disabled=!selected};xhr.onabort=()=>{activeXhr=null;cancel.hidden=true;document.querySelector('#progress').style.display='none';document.querySelector('#fill').style.width='0';document.querySelector('#percent').textContent='0%';message.className='message error';message.textContent='Загрузка отменена. Вы можете повторить её или вернуться к встречам.';submit.disabled=!selected};xhr.send(form)});
-cancel.addEventListener('click',()=>{if(activeXhr)activeXhr.abort()});
-</script></body></html>"""
+cloudConsent.addEventListener('change',()=>{if(cloudConsent.checked&&selected)startUpload()});cancel.addEventListener('click',()=>{if(activeXhr)activeXhr.abort()});</script></body></html>"""
 
 
 @app.post("/api/meetings/upload", status_code=201)
-async def upload_meeting(request: Request, file: UploadFile = File(...)) -> dict[str, object]:
+async def upload_meeting(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    cloud_processing_consent: bool = Form(...),
+) -> dict[str, object]:
     # AuthGateMiddleware rejects anonymous requests before FastAPI parses this multipart body.
     user = require_user(request)
+    if not cloud_processing_consent:
+        raise HTTPException(status_code=422, detail="Подтвердите согласие на автоматическую облачную обработку.")
     cleanup_expired_media()
     if not file.filename:
         raise HTTPException(status_code=422, detail="Не удалось прочитать имя загруженного файла.")
@@ -647,15 +677,16 @@ async def upload_meeting(request: Request, file: UploadFile = File(...)) -> dict
         initialize_storage()
         with sqlite3.connect(DATABASE_PATH) as connection:
             connection.execute(
-                "INSERT INTO meetings (id, filename, size_bytes, duration_seconds, status, created_at, owner_id, media_extension) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (meeting_id, Path(file.filename).name, size, duration, "uploaded", created_at, user["id"], extension),
+                "INSERT INTO meetings (id, filename, size_bytes, duration_seconds, status, created_at, owner_id, media_extension, title, meeting_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (meeting_id, Path(file.filename).name, size, duration, "processing_audio_extraction", created_at, user["id"], extension, Path(file.filename).name, created_at[:10]),
             )
+        background_tasks.add_task(process_meeting, meeting_id, DATA_DIR)
         return {
             "id": meeting_id,
             "filename": Path(file.filename).name,
             "size_bytes": size,
             "duration_seconds": duration,
-            "status": "uploaded",
+            "status": "processing_audio_extraction",
             "created_at": created_at,
         }
     except Exception:
@@ -675,14 +706,72 @@ def list_meetings(request: Request) -> list[dict[str, object]]:
         connection.row_factory = sqlite3.Row
         if user["role"] == "admin":
             rows = connection.execute(
-                "SELECT id, filename, size_bytes, duration_seconds, status, created_at, media_deleted_at FROM meetings ORDER BY created_at DESC"
+                """SELECT m.id, m.filename, COALESCE(NULLIF(m.title, ''), m.filename) AS title,
+                          m.meeting_date, m.agenda, m.analysis_json, m.size_bytes, m.duration_seconds,
+                          m.status, m.created_at, m.media_deleted_at,
+                          COALESCE(NULLIF(u.name, ''), u.email, '—') AS owner_name
+                   FROM meetings m LEFT JOIN users u ON u.id = m.owner_id ORDER BY m.created_at DESC"""
             ).fetchall()
         else:
             rows = connection.execute(
-                "SELECT id, filename, size_bytes, duration_seconds, status, created_at, media_deleted_at FROM meetings WHERE owner_id = ? ORDER BY created_at DESC",
+                "SELECT id, filename, COALESCE(NULLIF(title, ''), filename) AS title, meeting_date, agenda, analysis_json, size_bytes, duration_seconds, status, created_at, media_deleted_at FROM meetings WHERE owner_id = ? ORDER BY created_at DESC",
                 (user["id"],),
             ).fetchall()
-    return [dict(row) for row in rows]
+    items: list[dict[str, object]] = []
+    for row in rows:
+        item = dict(row)
+        raw_analysis = item.pop("analysis_json")
+        agenda = item.pop("agenda") or ""
+        try:
+            analysis = json.loads(raw_analysis) if raw_analysis else {}
+        except (TypeError, json.JSONDecodeError):
+            analysis = {}
+        if not isinstance(analysis, dict):
+            analysis = {}
+        topics = analysis.get("topics") if isinstance(analysis.get("topics"), list) else []
+        first_topic = topics[0].get("topic") if topics and isinstance(topics[0], dict) else ""
+        agenda_line = str(agenda).strip().splitlines()[0] if str(agenda).strip() else ""
+        item["topic"] = first_topic or agenda_line or None
+        item["key_results"] = {
+            "summary": len(analysis.get("summary_points", [])) if isinstance(analysis.get("summary_points"), list) else 0,
+            "decisions": len(analysis.get("decisions", [])) if isinstance(analysis.get("decisions"), list) else 0,
+            "tasks": len(analysis.get("tasks", [])) if isinstance(analysis.get("tasks"), list) else 0,
+            "questions": len(analysis.get("open_questions", [])) if isinstance(analysis.get("open_questions"), list) else 0,
+            "errors": int(str(item["status"]).startswith("failed_")),
+        }
+        items.append(item)
+    return items
+
+
+@app.get("/api/meetings/summary")
+def meeting_summary(request: Request) -> dict[str, int]:
+    user = require_user(request)
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        if user["role"] == "admin":
+            rows = connection.execute("SELECT status, analysis_json FROM meetings").fetchall()
+        else:
+            rows = connection.execute(
+                "SELECT status, analysis_json FROM meetings WHERE owner_id = ?", (user["id"],)
+            ).fetchall()
+
+    totals = {"processed_meetings": 0, "decisions": 0, "tasks": 0, "open_questions": 0, "errors": 0}
+    for status, analysis_json in rows:
+        if status == "completed":
+            totals["processed_meetings"] += 1
+        if str(status).startswith("failed_"):
+            totals["errors"] += 1
+        if not analysis_json:
+            continue
+        try:
+            analysis = json.loads(analysis_json)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(analysis, dict):
+            for field in ("decisions", "tasks", "open_questions"):
+                items = analysis.get(field)
+                if isinstance(items, list):
+                    totals[field] += len(items)
+    return totals
 
 
 @app.get("/api/meetings/{meeting_id}")
@@ -699,7 +788,7 @@ def get_meeting(meeting_id: str, request: Request) -> dict[str, object]:
     with sqlite3.connect(DATABASE_PATH) as connection:
         connection.row_factory = sqlite3.Row
         row = connection.execute(
-            "SELECT id, filename, size_bytes, duration_seconds, status, created_at, transcript, analysis_json, error_message, processed_at, media_deleted_at, owner_id FROM meetings WHERE id = ?",
+            "SELECT id, filename, title, meeting_date, agenda, notes, next_meeting_needed, next_meeting_date, next_meeting_topic, size_bytes, duration_seconds, status, created_at, transcript, analysis_json, error_message, processed_at, media_deleted_at, owner_id FROM meetings WHERE id = ?",
             (parsed_id,),
         ).fetchone()
     if row is None or (user["role"] != "admin" and row["owner_id"] != user["id"]):
@@ -707,8 +796,105 @@ def get_meeting(meeting_id: str, request: Request) -> dict[str, object]:
     meeting = dict(row)
     meeting.pop("owner_id")
     analysis_json = meeting.pop("analysis_json")
+    meeting["title"] = meeting["title"] or meeting["filename"]
     meeting["analysis"] = json.loads(analysis_json) if analysis_json else None
     return meeting
+
+
+def _required_text(payload: dict[str, object], key: str, max_length: int) -> str:
+    value = payload.get(key)
+    if not isinstance(value, str) or len(value) > max_length:
+        raise HTTPException(status_code=422, detail=f"Поле «{key}» заполнено некорректно.")
+    return value.strip()
+
+
+def _optional_date(payload: dict[str, object], key: str) -> str | None:
+    value = payload.get(key)
+    if value in (None, ""):
+        return None
+    if not isinstance(value, str):
+        raise HTTPException(status_code=422, detail=f"Поле «{key}» должно содержать дату.")
+    try:
+        return date.fromisoformat(value).isoformat()
+    except ValueError:
+        raise HTTPException(status_code=422, detail=f"Поле «{key}» содержит некорректную дату.") from None
+
+
+def _clean_analysis(value: object) -> dict[str, list[dict[str, str]]]:
+    if not isinstance(value, dict):
+        raise HTTPException(status_code=422, detail="Результаты обработки имеют неверный формат.")
+    fields = {
+        "summary_points": "point",
+        "topics": "topic",
+        "decisions": "decision",
+        "tasks": "action",
+        "open_questions": "question",
+    }
+    cleaned: dict[str, list[dict[str, str]]] = {}
+    for group, primary in fields.items():
+        items = value.get(group, [])
+        if not isinstance(items, list) or len(items) > 100:
+            raise HTTPException(status_code=422, detail="Проверьте список результатов встречи.")
+        cleaned[group] = []
+        keys = (primary, "responsible", "deadline", "evidence") if group == "tasks" else (primary, "evidence")
+        for item in items:
+            if not isinstance(item, dict):
+                raise HTTPException(status_code=422, detail="Проверьте формат результатов встречи.")
+            clean_item: dict[str, str] = {}
+            for key in keys:
+                text = item.get(key, "")
+                if not isinstance(text, str) or len(text) > 5000:
+                    raise HTTPException(status_code=422, detail="Один из пунктов результата слишком длинный.")
+                clean_item[key] = text.strip()
+            if clean_item[primary]:
+                cleaned[group].append(clean_item)
+    return cleaned
+
+
+@app.put("/api/meetings/{meeting_id}")
+async def update_meeting(meeting_id: str, request: Request) -> dict[str, object]:
+    user = require_user(request)
+    try:
+        parsed_id = str(uuid.UUID(meeting_id))
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Встреча не найдена.") from None
+    try:
+        payload = await request.json()
+    except (ValueError, json.JSONDecodeError):
+        raise HTTPException(status_code=400, detail="Не удалось прочитать изменения.") from None
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="Изменения встречи имеют неверный формат.")
+
+    title = _required_text(payload, "title", 250)
+    if not title:
+        raise HTTPException(status_code=422, detail="Укажите название встречи.")
+    meeting_date = _optional_date(payload, "meeting_date")
+    agenda = _required_text(payload, "agenda", 20000)
+    notes = _required_text(payload, "notes", 20000)
+    next_meeting_needed = payload.get("next_meeting_needed")
+    if not isinstance(next_meeting_needed, str) or next_meeting_needed not in {"yes", "no", "unspecified"}:
+        raise HTTPException(status_code=422, detail="Укажите, нужна ли следующая встреча.")
+    next_meeting_date = _optional_date(payload, "next_meeting_date")
+    next_meeting_topic = _required_text(payload, "next_meeting_topic", 5000)
+    transcript = _required_text(payload, "transcript", 100000)
+    analysis = _clean_analysis(payload.get("analysis"))
+
+    with sqlite3.connect(DATABASE_PATH, timeout=30) as connection:
+        connection.row_factory = sqlite3.Row
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute("SELECT owner_id, status FROM meetings WHERE id = ?", (parsed_id,)).fetchone()
+        if row is None or (user["role"] != "admin" and row["owner_id"] != user["id"]):
+            raise HTTPException(status_code=404, detail="Встреча не найдена.")
+        if str(row["status"]).startswith("processing_"):
+            raise HTTPException(status_code=409, detail="Нельзя менять встречу во время обработки.")
+        connection.execute(
+            """UPDATE meetings SET title = ?, meeting_date = ?, agenda = ?, notes = ?,
+               next_meeting_needed = ?, next_meeting_date = ?, next_meeting_topic = ?,
+               transcript = ?, analysis_json = ? WHERE id = ?""",
+            (title, meeting_date, agenda, notes, next_meeting_needed, next_meeting_date,
+             next_meeting_topic, transcript, json.dumps(analysis, ensure_ascii=False), parsed_id),
+        )
+    return {"id": parsed_id, "status": "saved"}
 
 
 @app.post("/api/meetings/{meeting_id}/process", status_code=202)
@@ -734,7 +920,7 @@ def start_processing(meeting_id: str, request: Request, background_tasks: Backgr
         extension = row["media_extension"] if row["media_extension"] in {".mp4", ".webm"} else ".mp4"
         if not (UPLOAD_DIR / f"{parsed_id}{extension}").is_file():
             raise HTTPException(status_code=409, detail="Исходный видеофайл недоступен для обработки.")
-        status = "processing_analysis" if row["transcript"] else "processing_transcription"
+        status = "processing_analysis" if row["transcript"] else "processing_audio_extraction"
         connection.execute(
             "UPDATE meetings SET status = ?, error_message = NULL WHERE id = ?",
             (status, parsed_id),
@@ -792,22 +978,42 @@ header{{height:72px;border-bottom:1px solid #e4e9e2;display:flex;align-items:cen
 main{{max-width:920px;margin:48px auto;padding:0 24px 60px}}a{{color:#287148;text-decoration:none;font-size:13px}}h1{{font-size:34px;letter-spacing:-.035em;margin:20px 0 8px}}.meta{{color:#78847b;font-size:13px;margin-bottom:25px}}.card{{background:#fff;border:1px solid #e3e8e1;border-radius:16px;padding:23px;margin-top:16px;box-shadow:0 12px 38px #253f2709}}.card h2{{font-size:17px;margin:0 0 13px;letter-spacing:-.02em}}
 .notice{{background:#f3f7f0;border-left:3px solid #6b9d71;padding:13px 15px;font-size:13px;line-height:1.6;color:#536357;border-radius:0 9px 9px 0}}.consent{{display:flex;gap:10px;align-items:flex-start;margin-top:15px;font-size:12px;line-height:1.5;color:#59675e}}.consent input{{margin-top:3px;accent-color:#246b49}}button{{margin-top:16px;border:0;border-radius:9px;padding:12px 17px;background:#246b49;color:#fff;font-weight:700;cursor:pointer}}button.secondary{{background:#edf2ec;color:#45574b}}button:disabled{{opacity:.45;cursor:not-allowed}}
 .status{{padding:13px 15px;border-radius:10px;background:#edf2ec;color:#516257;font-size:13px;line-height:1.5}}.status.ok{{background:#edf7ee;color:#276440}}.status.fail{{background:#fff2ef;color:#9c4339}}.error{{color:#9c4339;font-size:13px}}.grid{{display:grid;grid-template-columns:1fr 1fr;gap:14px}}.result-section{{background:white;border:1px solid #e6ebe4;border-radius:12px;padding:17px;margin-top:14px}}.result-section h3{{font-size:15px;margin:0 0 11px}}.result-item{{font-size:13px;line-height:1.6;margin:0 0 12px}}blockquote{{margin:5px 0 0;padding-left:10px;border-left:2px solid #d9e5d9;color:#77847b;font-size:12px}}.empty{{font-size:13px;color:#78847b;font-style:italic}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;font-family:inherit;font-size:13px;line-height:1.7;color:#3c4b40;margin:0}}.transcript{{max-height:460px;overflow:auto}}.muted{{color:#78847b;font-size:12px}}
-@media(max-width:650px){{main{{margin-top:28px}}h1{{font-size:27px}}.grid{{grid-template-columns:1fr}}.card{{padding:18px}}}}
+.edit-grid{{display:grid;grid-template-columns:1fr 1fr;gap:14px}}.edit-field{{display:flex;flex-direction:column;gap:6px;color:#56645a;font-size:12px;font-weight:650}}.edit-field.full{{grid-column:1/-1}}.edit-field input,.edit-field select,.edit-field textarea{{width:100%;font:inherit;font-size:13px;font-weight:400;color:#25352b;border:1px solid #dce4dc;border-radius:9px;padding:10px;background:#fcfdfb}}.edit-field textarea{{min-height:88px;resize:vertical;line-height:1.5}}.edit-field textarea.tall{{min-height:170px}}.edit-help{{font-size:11px;color:#7a867d;font-weight:400}}.save-row{{display:flex;align-items:center;gap:12px;flex-wrap:wrap}}#saveState{{font-size:12px;color:#657469}}#saveState.error{{color:#9c4339}}
+@media(max-width:650px){{main{{margin-top:28px}}h1{{font-size:27px}}.grid,.edit-grid{{grid-template-columns:1fr}}.edit-field.full{{grid-column:auto}}.card{{padding:18px}}}}
 </style></head><body><header><div class="brand"><i>М</i>Встречи</div></header><main>
 <a href="/">← Все встречи</a><h1 id="title">Встреча</h1>{admin_button}<div class="meta" id="meta"></div>
+<section class="card" id="editor"><h2>Данные встречи и результаты</h2><div class="edit-grid">
+<label class="edit-field">Название встречи<input id="editTitle" maxlength="250"></label><label class="edit-field">Дата встречи<input id="editMeetingDate" type="date"></label>
+<label class="edit-field full">Повестка<textarea id="editAgenda" maxlength="20000"></textarea></label><label class="edit-field full">Заметки и выводы<textarea id="editNotes" maxlength="20000"></textarea></label>
+<label class="edit-field">Нужна ли следующая встреча<select id="editNextNeeded"><option value="unspecified">Не указано</option><option value="yes">Да</option><option value="no">Нет</option></select></label><label class="edit-field">Дата следующей встречи<input id="editNextDate" type="date"></label>
+<label class="edit-field full">Тема следующей встречи<input id="editNextTopic" maxlength="5000"></label>
+<label class="edit-field full">Расшифровка<textarea class="tall" id="editTranscript" maxlength="100000"></textarea></label>
+<label class="edit-field">Краткое содержание<textarea id="editSummary"></textarea><span class="edit-help">Каждый пункт — с новой строки; цитату можно добавить после |</span></label>
+<label class="edit-field">Основные темы<textarea id="editTopics"></textarea><span class="edit-help">Каждая тема — с новой строки; цитату можно добавить после |</span></label>
+<label class="edit-field">Решения<textarea id="editDecisions"></textarea><span class="edit-help">Каждое решение — с новой строки; цитату можно добавить после |</span></label>
+<label class="edit-field">Открытые вопросы<textarea id="editQuestions"></textarea><span class="edit-help">Каждый вопрос — с новой строки; цитату можно добавить после |</span></label>
+<label class="edit-field full">Задачи<textarea id="editTasks"></textarea><span class="edit-help">Каждая задача — с новой строки: действие | ответственный | срок | подтверждающая цитата</span></label>
+</div><div class="save-row"><button id="saveEdits" type="button">Сохранить изменения</button><span id="saveState" role="status"></span></div></section>
 <section class="card" id="actionCard"><h2>Передача аудио для обработки</h2><div class="notice">Для распознавания аудио из видео и анализа его расшифровки данные будут отправлены в OpenAI API. Запросы оплачиваются по тарифам API; точную сумму перед запуском приложение не рассчитывает. Аудиофайл после запроса удаляется из временного каталога приложения.</div><label class="consent"><input type="checkbox" id="consent"><span>Понимаю, что аудио и его расшифровка будут переданы облачному AI-провайдеру, и подтверждаю запуск обработки.</span></label><button id="process" disabled>Начать обработку</button><p class="muted">При сбое можно запустить повтор вручную. Если расшифровка уже сохранена, повторится только анализ.</p></section>
 <div class="status" id="status">Загружаем статус встречи…</div><p class="error" id="error"></p>
 <section id="results" hidden><div class="grid"><div class="result-section"><h3>Краткое содержание</h3><div id="summary"></div></div><div class="result-section"><h3>Основные темы</h3><div id="topics"></div></div><div class="result-section"><h3>Решения</h3><div id="decisions"></div></div><div class="result-section"><h3>Задачи</h3><div id="tasks"></div></div><div class="result-section"><h3>Открытые вопросы</h3><div id="questions"></div></div></div><div class="card"><h2>Расшифровка речи</h2><div class="transcript"><pre id="transcript"></pre></div></div></section>
 </main><script>
 const id='{safe_id}', isAdmin={str(user['role'] == 'admin').lower()}, statusBox=document.querySelector('#status'), errorBox=document.querySelector('#error'), processButton=document.querySelector('#process'), consent=document.querySelector('#consent'), actionCard=document.querySelector('#actionCard');let pollTimer=null;
-const labels={{uploaded:'Видео загружено и проверено. Обработка ещё не запускалась.',processing_transcription:'Извлекаем аудио и распознаём речь. Это может занять несколько минут.',processing_analysis:'Расшифровка готова. Формируем структурированные итоги встречи.',completed:'Обработка завершена.',failed_transcription:'Не удалось получить расшифровку.',failed_analysis:'Расшифровка сохранена, но анализ не завершился. Повтор обработает сохранённый текст.',idle:'Загружаем статус встречи…'}};
+let editorDirty=false;const saveButton=document.querySelector('#saveEdits'),saveState=document.querySelector('#saveState');
+const labels={{uploaded:'Видео загружено и проверено.',processing_audio_extraction:'Извлекаем аудио из видео…',processing_transcription:'Распознаём речь…',processing_analysis:'AI-анализ встречи…',completed:'Обработка завершена.',failed_transcription:'Не удалось получить расшифровку.',failed_analysis:'Расшифровка сохранена, но анализ не завершился. Повтор обработает сохранённый текст.',idle:'Загружаем статус встречи…'}};
 function node(tag,text,className){{const element=document.createElement(tag);if(text)element.textContent=text;if(className)element.className=className;return element}}
 function renderList(target,items,key,empty){{const root=document.querySelector(target);root.replaceChildren();if(!Array.isArray(items)||!items.length){{root.append(node('p',empty,'empty'));return}}for(const item of items){{const block=node('p',item[key],'result-item');if(item.evidence)block.append(node('blockquote',`«${{item.evidence}}»`));root.append(block)}}}}
 function renderTasks(items){{const root=document.querySelector('#tasks');root.replaceChildren();if(!Array.isArray(items)||!items.length){{root.append(node('p','Не обнаружено по расшифровке.','empty'));return}}for(const task of items){{const block=node('p',task.action,'result-item');const details=[task.responsible&&`Ответственный: ${{task.responsible}}`,task.deadline&&`Срок: ${{task.deadline}}`].filter(Boolean).join(' · ');if(details)block.append(node('div',details,'muted'));if(task.evidence)block.append(node('blockquote',`«${{task.evidence}}»`));root.append(block)}}}}
-async function refresh(){{try{{const response=await fetch(`/api/meetings/${{id}}`);if(!response.ok)throw new Error('Не удалось загрузить встречу.');const meeting=await response.json();document.querySelector('#title').textContent=meeting.filename;const size=(meeting.size_bytes/1048576).toFixed(1),duration=Math.floor(meeting.duration_seconds),time=`${{Math.floor(duration/60)}}:${{String(duration%60).padStart(2,'0')}}`;document.querySelector('#meta').textContent=`${{size}} МБ · ${{time}}`;
-const active=meeting.status.startsWith('processing_'), failed=meeting.status.startsWith('failed_');statusBox.textContent=labels[meeting.status]||'Состояние встречи неизвестно.';statusBox.className='status '+(meeting.status==='completed'?'ok':failed?'fail':'');errorBox.textContent=meeting.error_message||(meeting.media_deleted_at?'Исходное видео удалено по сроку хранения. Сохранённые текстовые результаты доступны ниже.':'');actionCard.hidden=meeting.media_deleted_at||!(meeting.status==='uploaded'||failed);if(meeting.media_deleted_at)statusBox.textContent='Исходное видео удалено через 24 часа; текстовые результаты сохранены.';processButton.textContent=failed?'Повторить обработку':'Начать обработку';processButton.disabled=active||!consent.checked;
+function editorItems(items,key){{return Array.isArray(items)?items.map(item=>String(item[key]||'')+(item.evidence?' | '+item.evidence:'')).join('\\n'):''}}
+function parseEditorItems(text,key){{return text.split(/\\r?\\n/).map(line=>line.trim()).filter(Boolean).map(line=>{{const [primary,...evidence]=line.split('|');return {{[key]:primary.trim(),evidence:evidence.join('|').trim()}}}})}}
+function fillEditor(meeting){{const values={{editTitle:meeting.title||meeting.filename,editMeetingDate:meeting.meeting_date||'',editAgenda:meeting.agenda||'',editNotes:meeting.notes||'',editNextNeeded:meeting.next_meeting_needed||'unspecified',editNextDate:meeting.next_meeting_date||'',editNextTopic:meeting.next_meeting_topic||'',editTranscript:meeting.transcript||''}};for(const [key,value] of Object.entries(values))document.querySelector('#'+key).value=value;const a=meeting.analysis||{{}};document.querySelector('#editSummary').value=editorItems(a.summary_points,'point');document.querySelector('#editTopics').value=editorItems(a.topics,'topic');document.querySelector('#editDecisions').value=editorItems(a.decisions,'decision');document.querySelector('#editQuestions').value=editorItems(a.open_questions,'question');document.querySelector('#editTasks').value=Array.isArray(a.tasks)?a.tasks.map(task=>[task.action||'',task.responsible||'',task.deadline||'',task.evidence||''].join(' | ')).join('\\n'):''}}
+function currentEdits(){{const value=id=>document.querySelector('#'+id).value;const tasks=value('editTasks').split(/\\r?\\n/).map(line=>line.trim()).filter(Boolean).map(line=>{{const [action='',responsible='',deadline='',...evidence]=line.split('|');return {{action:action.trim(),responsible:responsible.trim(),deadline:deadline.trim(),evidence:evidence.join('|').trim()}}}});return {{title:value('editTitle'),meeting_date:value('editMeetingDate'),agenda:value('editAgenda'),notes:value('editNotes'),next_meeting_needed:value('editNextNeeded'),next_meeting_date:value('editNextDate'),next_meeting_topic:value('editNextTopic'),transcript:value('editTranscript'),analysis:{{summary_points:parseEditorItems(value('editSummary'),'point'),topics:parseEditorItems(value('editTopics'),'topic'),decisions:parseEditorItems(value('editDecisions'),'decision'),open_questions:parseEditorItems(value('editQuestions'),'question'),tasks}}}}}}
+document.querySelector('#editor').addEventListener('input',()=>{{editorDirty=true;saveState.textContent='Есть несохранённые изменения';saveState.className=''}});
+async function refresh(){{try{{const response=await fetch(`/api/meetings/${{id}}`);if(!response.ok)throw new Error('Не удалось загрузить встречу.');const meeting=await response.json();document.querySelector('#title').textContent=meeting.title||meeting.filename;const size=(meeting.size_bytes/1048576).toFixed(1),duration=Math.floor(meeting.duration_seconds),time=`${{Math.floor(duration/60)}}:${{String(duration%60).padStart(2,'0')}}`;document.querySelector('#meta').textContent=`${{size}} МБ · ${{time}}${{meeting.meeting_date?' · '+meeting.meeting_date:''}}`;
+const active=meeting.status.startsWith('processing_'), failed=meeting.status.startsWith('failed_');if(!editorDirty)fillEditor(meeting);document.querySelectorAll('#editor input,#editor select,#editor textarea').forEach(field=>field.disabled=active);saveButton.disabled=active;statusBox.textContent=labels[meeting.status]||'Состояние встречи неизвестно.';statusBox.className='status '+(meeting.status==='completed'?'ok':failed?'fail':'');errorBox.textContent=meeting.error_message||(meeting.media_deleted_at?'Исходное видео удалено по сроку хранения. Сохранённые текстовые результаты доступны ниже.':'');actionCard.hidden=meeting.media_deleted_at||!(meeting.status==='uploaded'||failed);if(meeting.media_deleted_at)statusBox.textContent='Исходное видео удалено через 24 часа; текстовые результаты сохранены.';processButton.textContent=failed?'Повторить обработку':'Начать обработку';processButton.disabled=active||!consent.checked;
 if(active&&!pollTimer)pollTimer=setInterval(refresh,2500);if(!active&&pollTimer){{clearInterval(pollTimer);pollTimer=null}}
 if(meeting.status==='completed'&&meeting.analysis){{document.querySelector('#results').hidden=false;renderList('#summary',meeting.analysis.summary_points,'point','Не удалось подготовить подтверждённое содержание.');renderList('#topics',meeting.analysis.topics,'topic','Не удалось определить темы.');renderList('#decisions',meeting.analysis.decisions,'decision','Решения не обнаружены по расшифровке.');renderTasks(meeting.analysis.tasks);renderList('#questions',meeting.analysis.open_questions,'question','Открытые вопросы не обнаружены по расшифровке.');document.querySelector('#transcript').textContent=meeting.transcript||''}}
 }}catch(error){{statusBox.textContent=error.message;statusBox.className='status fail'}}}}
+saveButton.addEventListener('click',async()=>{{saveButton.disabled=true;saveState.textContent='Сохраняем…';saveState.className='';try{{const response=await fetch(`/api/meetings/${{id}}`,{{method:'PUT',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(currentEdits())}});const body=await response.json();if(!response.ok)throw new Error(body.detail||'Не удалось сохранить изменения.');editorDirty=false;saveState.textContent='Изменения сохранены';await refresh()}}catch(error){{saveState.textContent=error.message;saveState.className='error';saveButton.disabled=false}}}});
 consent.addEventListener('change',()=>{{processButton.disabled=!consent.checked}});processButton.addEventListener('click',async()=>{{processButton.disabled=true;errorBox.textContent='';try{{const response=await fetch(`/api/meetings/${{id}}/process`,{{method:'POST'}});const body=await response.json();if(!response.ok)throw new Error(body.detail||'Не удалось запустить обработку.');await refresh()}}catch(error){{errorBox.textContent=error.message;processButton.disabled=!consent.checked}}}});const deleteButton=document.querySelector('#deleteMeeting');if(isAdmin&&deleteButton)deleteButton.addEventListener('click',async()=>{{if(!confirm('Удалить встречу и связанные с ней материалы?'))return;const response=await fetch(`/api/meetings/${{id}}`,{{method:'DELETE'}});if(response.ok)location.href='/';else{{const body=await response.json();errorBox.textContent=body.detail||'Не удалось удалить встречу.'}}}});refresh();
 </script></body></html>"""
