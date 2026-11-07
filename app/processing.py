@@ -117,6 +117,8 @@ def _safe_failure(exc: Exception, stage: str) -> str:
         return "Не удалось связаться с AI-провайдером. Проверьте сеть и повторите обработку вручную."
     if isinstance(exc, APIStatusError):
         return f"AI-провайдер не принял запрос на этапе {stage}. Проверьте модель и настройки API."
+    if isinstance(exc, subprocess.CalledProcessError):
+        return "FFmpeg не смог подготовить аудио. Откройте просмотр логов для подробностей."
     if isinstance(exc, FileNotFoundError):
         return "На сервере недоступна обработка медиа. Проверьте установку FFmpeg."
     return f"Не удалось выполнить этап {stage}. Исходная запись сохранена; можно запустить повторную обработку."
@@ -129,7 +131,14 @@ def _failure_details(exc: Exception, stage: str) -> str:
         "stage": stage,
         "exception_type": type(exc).__name__,
     }
-    if isinstance(exc, APIStatusError):
+    if isinstance(exc, subprocess.CalledProcessError):
+        details["return_code"] = exc.returncode
+        stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+        stderr = re.sub(r"(?i)(bearer\s+)[^\s\"']+", r"\1[REDACTED]", stderr)
+        stderr = re.sub(r"(?i)(sk-[a-z0-9_-]{8,})", "[REDACTED]", stderr)
+        if stderr.strip():
+            details["ffmpeg_error"] = stderr.strip()[-1200:]
+    elif isinstance(exc, APIStatusError):
         details["http_status"] = exc.status_code
         if exc.request_id:
             details["request_id"] = exc.request_id
@@ -320,18 +329,30 @@ def process_meeting(meeting_id: str, data_dir: Path) -> None:
             temp_root.mkdir(parents=True, exist_ok=True)
             with tempfile.TemporaryDirectory(prefix=f"meeting-{meeting_id}-", dir=temp_root) as temp_dir:
                 audio_path = Path(temp_dir) / "speech.mp3"
-                subprocess.run(
-                    [
-                        ffmpeg, "-nostdin", "-v", "error", "-i", str(video_path),
-                        "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "24000",
-                        "-c:a", "libmp3lame", "-b:a", "64k", "-f", "mp3", str(audio_path),
-                    ],
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=120,
-                    check=True,
-                )
+                command = [
+                    ffmpeg, "-nostdin", "-v", "error", "-i", str(video_path),
+                    "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "24000",
+                    "-c:a", "libmp3lame", "-b:a", "64k", "-f", "mp3", str(audio_path),
+                ]
+                # Keep only a small tail of FFmpeg's diagnostics. Using a
+                # temporary file avoids buffering unbounded stderr in memory.
+                with tempfile.TemporaryFile() as ffmpeg_stderr:
+                    result = subprocess.run(
+                        command,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=ffmpeg_stderr,
+                        timeout=120,
+                        check=False,
+                    )
+                    if result.returncode:
+                        ffmpeg_stderr.seek(0, os.SEEK_END)
+                        stderr_size = ffmpeg_stderr.tell()
+                        ffmpeg_stderr.seek(max(0, stderr_size - 8192))
+                        stderr_text = ffmpeg_stderr.read().decode("utf-8", errors="replace")
+                        raise subprocess.CalledProcessError(
+                            result.returncode, command, stderr=stderr_text
+                        )
                 if not audio_path.exists() or audio_path.stat().st_size == 0:
                     raise ValueError("audio extraction produced no data")
                 if audio_path.stat().st_size > MAX_TRANSCRIPTION_BYTES:
