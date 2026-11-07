@@ -154,6 +154,7 @@ def initialize_storage() -> None:
                 transcript TEXT,
                 analysis_json TEXT,
                 error_message TEXT,
+                error_details TEXT,
                 processed_at TEXT,
                 media_deleted_at TEXT
             )"""
@@ -172,6 +173,7 @@ def initialize_storage() -> None:
             ("transcript", "TEXT"),
             ("analysis_json", "TEXT"),
             ("error_message", "TEXT"),
+            ("error_details", "TEXT"),
             ("processed_at", "TEXT"),
             ("media_deleted_at", "TEXT"),
         ):
@@ -708,13 +710,13 @@ def list_meetings(request: Request) -> list[dict[str, object]]:
             rows = connection.execute(
                 """SELECT m.id, m.filename, COALESCE(NULLIF(m.title, ''), m.filename) AS title,
                           m.meeting_date, m.agenda, m.analysis_json, m.size_bytes, m.duration_seconds,
-                          m.status, m.created_at, m.media_deleted_at,
+                          m.status, m.created_at, m.media_deleted_at, m.error_message,
                           COALESCE(NULLIF(u.name, ''), u.email, '—') AS owner_name
                    FROM meetings m LEFT JOIN users u ON u.id = m.owner_id ORDER BY m.created_at DESC"""
             ).fetchall()
         else:
             rows = connection.execute(
-                "SELECT id, filename, COALESCE(NULLIF(title, ''), filename) AS title, meeting_date, agenda, analysis_json, size_bytes, duration_seconds, status, created_at, media_deleted_at FROM meetings WHERE owner_id = ? ORDER BY created_at DESC",
+                "SELECT id, filename, COALESCE(NULLIF(title, ''), filename) AS title, meeting_date, agenda, analysis_json, size_bytes, duration_seconds, status, created_at, media_deleted_at, error_message FROM meetings WHERE owner_id = ? ORDER BY created_at DESC",
                 (user["id"],),
             ).fetchall()
     items: list[dict[str, object]] = []
@@ -788,7 +790,7 @@ def get_meeting(meeting_id: str, request: Request) -> dict[str, object]:
     with sqlite3.connect(DATABASE_PATH) as connection:
         connection.row_factory = sqlite3.Row
         row = connection.execute(
-            "SELECT id, filename, title, meeting_date, agenda, notes, next_meeting_needed, next_meeting_date, next_meeting_topic, size_bytes, duration_seconds, status, created_at, transcript, analysis_json, error_message, processed_at, media_deleted_at, owner_id FROM meetings WHERE id = ?",
+            "SELECT id, filename, title, meeting_date, agenda, notes, next_meeting_needed, next_meeting_date, next_meeting_topic, size_bytes, duration_seconds, status, created_at, transcript, analysis_json, error_message, error_details, processed_at, media_deleted_at, owner_id FROM meetings WHERE id = ?",
             (parsed_id,),
         ).fetchone()
     if row is None or (user["role"] != "admin" and row["owner_id"] != user["id"]):
@@ -799,6 +801,29 @@ def get_meeting(meeting_id: str, request: Request) -> dict[str, object]:
     meeting["title"] = meeting["title"] or meeting["filename"]
     meeting["analysis"] = json.loads(analysis_json) if analysis_json else None
     return meeting
+
+
+@app.get("/api/meetings/{meeting_id}/logs")
+def get_meeting_logs(meeting_id: str, request: Request) -> dict[str, object]:
+    """Return sanitized diagnostics for an owned meeting, never process-wide logs."""
+    user = require_user(request)
+    try:
+        parsed_id = str(uuid.UUID(meeting_id))
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Meeting not found.") from None
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT status, error_message, error_details, owner_id FROM meetings WHERE id = ?",
+            (parsed_id,),
+        ).fetchone()
+    if row is None or (user["role"] != "admin" and row["owner_id"] != user["id"]):
+        raise HTTPException(status_code=404, detail="Meeting not found.")
+    try:
+        details = json.loads(row["error_details"]) if row["error_details"] else None
+    except (TypeError, json.JSONDecodeError):
+        details = None
+    return {"status": row["status"], "message": row["error_message"], "details": details}
 
 
 def _required_text(payload: dict[str, object], key: str, max_length: int) -> str:
@@ -922,7 +947,7 @@ def start_processing(meeting_id: str, request: Request, background_tasks: Backgr
             raise HTTPException(status_code=409, detail="Исходный видеофайл недоступен для обработки.")
         status = "processing_analysis" if row["transcript"] else "processing_audio_extraction"
         connection.execute(
-            "UPDATE meetings SET status = ?, error_message = NULL WHERE id = ?",
+            "UPDATE meetings SET status = ?, error_message = NULL, error_details = NULL WHERE id = ?",
             (status, parsed_id),
         )
 

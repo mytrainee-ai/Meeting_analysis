@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -14,6 +15,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from openai import APIConnectionError, APIStatusError, APITimeoutError, AuthenticationError, OpenAI, RateLimitError
+
+logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
@@ -117,6 +120,38 @@ def _safe_failure(exc: Exception, stage: str) -> str:
     if isinstance(exc, FileNotFoundError):
         return "На сервере недоступна обработка медиа. Проверьте установку FFmpeg."
     return f"Не удалось выполнить этап {stage}. Исходная запись сохранена; можно запустить повторную обработку."
+
+
+def _failure_details(exc: Exception, stage: str) -> str:
+    """Keep actionable per-meeting diagnostics while excluding credentials."""
+    details: dict[str, object] = {
+        "failed_at": datetime.now(timezone.utc).isoformat(),
+        "stage": stage,
+        "exception_type": type(exc).__name__,
+    }
+    if isinstance(exc, APIStatusError):
+        details["http_status"] = exc.status_code
+        if exc.request_id:
+            details["request_id"] = exc.request_id
+        try:
+            payload = exc.response.json()
+            error_payload = payload.get("error") if isinstance(payload, dict) else None
+            provider_message = error_payload.get("message", "") if isinstance(error_payload, dict) else ""
+            if not isinstance(provider_message, str):
+                provider_message = ""
+        except Exception:
+            provider_message = ""
+        # API error bodies help diagnose unsupported models/endpoints. Redact
+        # authorization-like tokens before storing or showing the excerpt.
+        provider_message = re.sub(r"(?i)(bearer\s+)[^\s\"']+", r"\1[REDACTED]", provider_message)
+        provider_message = re.sub(r"(?i)(sk-[a-z0-9_-]{8,})", "[REDACTED]", provider_message)
+        if provider_message:
+            details["provider_response"] = provider_message[:1200]
+    elif isinstance(exc, (AuthenticationError, RateLimitError)):
+        details["http_status"] = exc.status_code
+        if exc.request_id:
+            details["request_id"] = exc.request_id
+    return json.dumps(details, ensure_ascii=False)
 
 
 def _transcribe(client: OpenAI, audio_path: Path) -> str:
@@ -341,10 +376,12 @@ def process_meeting(meeting_id: str, data_dir: Path) -> None:
         elif isinstance(exc, RateLimitError):
             stage = "обращение к AI-провайдеру"
         safe_error = _safe_failure(exc, stage)
+        error_details = _failure_details(exc, stage)
+        logger.warning("Meeting processing failed: meeting_id=%s %s", meeting_id, error_details)
         with _connect(database_path) as connection:
             row = connection.execute("SELECT transcript FROM meetings WHERE id = ?", (meeting_id,)).fetchone()
             status = "failed_analysis" if row and row["transcript"] else "failed_transcription"
             connection.execute(
-                "UPDATE meetings SET status = ?, error_message = ? WHERE id = ?",
-                (status, safe_error, meeting_id),
+                "UPDATE meetings SET status = ?, error_message = ?, error_details = ? WHERE id = ?",
+                (status, safe_error, error_details, meeting_id),
             )
